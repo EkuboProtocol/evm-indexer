@@ -8,6 +8,10 @@ declare namespace NodeJS {
     POSITIONS_ADDRESS: `0x${string}`;
     ORACLE_ADDRESS: `0x${string}`;
 
+    CORE_V2_ADDRESS: `0x${string}`;
+    POSITIONS_V2_ADDRESS: `0x${string}`;
+    ORACLE_V2_ADDRESS: `0x${string}`;
+
     STARTING_CURSOR_BLOCK_NUMBER: string;
 
     APIBARA_AUTH_TOKEN: string;
