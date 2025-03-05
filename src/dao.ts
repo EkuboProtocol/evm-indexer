@@ -244,11 +244,245 @@ export class DAO {
                  JOIN pl ON lss.key_hash = pl.key_hash
             );
 
-        CREATE MATERIALIZED VIEW IF NOT EXISTS pool_states_materialized AS
+        CREATE TABLE IF NOT EXISTS pool_states_table
         (
+            pool_key_hash                  NUMERIC PRIMARY KEY,
+            last_event_id                  int8,
+            last_liquidity_update_event_id int8,
+            sqrt_ratio                     NUMERIC,
+            liquidity                      NUMERIC,
+            tick                           int4
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_states_table_pool_key_hash ON pool_states_table USING btree (pool_key_hash);
+
+        -- Initial population of the table
+        DELETE FROM pool_states_table;
+        INSERT INTO pool_states_table (pool_key_hash, last_event_id, last_liquidity_update_event_id, sqrt_ratio, liquidity, tick)
         SELECT pool_key_hash, last_event_id, last_liquidity_update_event_id, sqrt_ratio, liquidity, tick
-        FROM pool_states_view);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_states_materialized_pool_key_hash ON pool_states_materialized USING btree (pool_key_hash);
+        FROM pool_states_view;
+
+        -- Function to update pool_states_table after a swap
+        CREATE OR REPLACE FUNCTION update_pool_states_after_swap()
+            RETURNS TRIGGER AS
+        $$
+        BEGIN
+            -- Get the current state
+            WITH lss AS (SELECT key_hash,
+                                COALESCE(last_swap.event_id, pi.event_id)           AS last_swap_event_id,
+                                COALESCE(last_swap.sqrt_ratio_after, pi.sqrt_ratio) AS sqrt_ratio,
+                                COALESCE(last_swap.tick_after, pi.tick)             AS tick,
+                                COALESCE(last_swap.liquidity_after, 0)              AS liquidity_last
+                         FROM pool_keys
+                                  LEFT JOIN LATERAL (
+                             SELECT event_id, sqrt_ratio_after, tick_after, liquidity_after
+                             FROM swaps
+                             WHERE pool_keys.key_hash = swaps.pool_key_hash
+                             ORDER BY event_id DESC
+                             LIMIT 1
+                             ) AS last_swap ON TRUE
+                                  LEFT JOIN LATERAL (
+                             SELECT event_id, sqrt_ratio, tick
+                             FROM pool_initializations
+                             WHERE pool_initializations.pool_key_hash = pool_keys.key_hash
+                             ORDER BY event_id DESC
+                             LIMIT 1
+                             ) AS pi ON TRUE
+                         WHERE key_hash = NEW.pool_key_hash),
+                 pl AS (SELECT key_hash,
+                               (SELECT event_id
+                                FROM position_updates
+                                WHERE key_hash = position_updates.pool_key_hash
+                                ORDER BY event_id DESC
+                                LIMIT 1)                                   AS last_update_event_id,
+                               (COALESCE(liquidity_last, 0) + COALESCE((SELECT SUM(liquidity_delta)
+                                                                        FROM position_updates AS pu
+                                                                        WHERE lss.last_swap_event_id < pu.event_id
+                                                                          AND pu.pool_key_hash = lss.key_hash
+                                                                          AND lss.tick BETWEEN pu.lower_bound AND (pu.upper_bound - 1)),
+                                                                       0)) AS liquidity
+                        FROM lss)
+            UPDATE pool_states_table
+            SET last_event_id                  = GREATEST(lss.last_swap_event_id, pl.last_update_event_id),
+                last_liquidity_update_event_id = pl.last_update_event_id,
+                sqrt_ratio                     = lss.sqrt_ratio,
+                tick                           = lss.tick,
+                liquidity                      = pl.liquidity
+            FROM lss
+                     JOIN pl ON lss.key_hash = pl.key_hash
+            WHERE pool_states_table.pool_key_hash = lss.key_hash;
+
+            -- If no row exists, insert it
+            IF NOT FOUND THEN
+                INSERT INTO pool_states_table (pool_key_hash, last_event_id, last_liquidity_update_event_id, sqrt_ratio, liquidity, tick)
+                SELECT lss.key_hash                                              AS pool_key_hash,
+                       GREATEST(lss.last_swap_event_id, pl.last_update_event_id) AS last_event_id,
+                       pl.last_update_event_id                                   AS last_liquidity_update_event_id,
+                       sqrt_ratio,
+                       liquidity,
+                       tick
+                FROM lss
+                         JOIN pl ON lss.key_hash = pl.key_hash
+                WHERE lss.key_hash = NEW.pool_key_hash;
+            END IF;
+
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- Function to update pool_states_table after a position update
+        CREATE OR REPLACE FUNCTION update_pool_states_after_position_update()
+            RETURNS TRIGGER AS
+        $$
+        BEGIN
+            -- Get the current state
+            WITH lss AS (SELECT key_hash,
+                                COALESCE(last_swap.event_id, pi.event_id)           AS last_swap_event_id,
+                                COALESCE(last_swap.sqrt_ratio_after, pi.sqrt_ratio) AS sqrt_ratio,
+                                COALESCE(last_swap.tick_after, pi.tick)             AS tick,
+                                COALESCE(last_swap.liquidity_after, 0)              AS liquidity_last
+                         FROM pool_keys
+                                  LEFT JOIN LATERAL (
+                             SELECT event_id, sqrt_ratio_after, tick_after, liquidity_after
+                             FROM swaps
+                             WHERE pool_keys.key_hash = swaps.pool_key_hash
+                             ORDER BY event_id DESC
+                             LIMIT 1
+                             ) AS last_swap ON TRUE
+                                  LEFT JOIN LATERAL (
+                             SELECT event_id, sqrt_ratio, tick
+                             FROM pool_initializations
+                             WHERE pool_initializations.pool_key_hash = pool_keys.key_hash
+                             ORDER BY event_id DESC
+                             LIMIT 1
+                             ) AS pi ON TRUE
+                         WHERE key_hash = NEW.pool_key_hash),
+                 pl AS (SELECT key_hash,
+                               (SELECT event_id
+                                FROM position_updates
+                                WHERE key_hash = position_updates.pool_key_hash
+                                ORDER BY event_id DESC
+                                LIMIT 1)                                   AS last_update_event_id,
+                               (COALESCE(liquidity_last, 0) + COALESCE((SELECT SUM(liquidity_delta)
+                                                                        FROM position_updates AS pu
+                                                                        WHERE lss.last_swap_event_id < pu.event_id
+                                                                          AND pu.pool_key_hash = lss.key_hash
+                                                                          AND lss.tick BETWEEN pu.lower_bound AND (pu.upper_bound - 1)),
+                                                                       0)) AS liquidity
+                        FROM lss)
+            UPDATE pool_states_table
+            SET last_event_id                  = GREATEST(lss.last_swap_event_id, pl.last_update_event_id),
+                last_liquidity_update_event_id = pl.last_update_event_id,
+                sqrt_ratio                     = lss.sqrt_ratio,
+                tick                           = lss.tick,
+                liquidity                      = pl.liquidity
+            FROM lss
+                     JOIN pl ON lss.key_hash = pl.key_hash
+            WHERE pool_states_table.pool_key_hash = lss.key_hash;
+
+            -- If no row exists, insert it
+            IF NOT FOUND THEN
+                INSERT INTO pool_states_table (pool_key_hash, last_event_id, last_liquidity_update_event_id, sqrt_ratio, liquidity, tick)
+                SELECT lss.key_hash                                              AS pool_key_hash,
+                       GREATEST(lss.last_swap_event_id, pl.last_update_event_id) AS last_event_id,
+                       pl.last_update_event_id                                   AS last_liquidity_update_event_id,
+                       sqrt_ratio,
+                       liquidity,
+                       tick
+                FROM lss
+                         JOIN pl ON lss.key_hash = pl.key_hash
+                WHERE lss.key_hash = NEW.pool_key_hash;
+            END IF;
+
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- Function to update pool_states_table after a pool initialization
+        CREATE OR REPLACE FUNCTION update_pool_states_after_pool_init()
+            RETURNS TRIGGER AS
+        $$
+        BEGIN
+            -- Get the current state
+            WITH lss AS (SELECT key_hash,
+                                COALESCE(last_swap.event_id, pi.event_id)           AS last_swap_event_id,
+                                COALESCE(last_swap.sqrt_ratio_after, pi.sqrt_ratio) AS sqrt_ratio,
+                                COALESCE(last_swap.tick_after, pi.tick)             AS tick,
+                                COALESCE(last_swap.liquidity_after, 0)              AS liquidity_last
+                         FROM pool_keys
+                                  LEFT JOIN LATERAL (
+                             SELECT event_id, sqrt_ratio_after, tick_after, liquidity_after
+                             FROM swaps
+                             WHERE pool_keys.key_hash = swaps.pool_key_hash
+                             ORDER BY event_id DESC
+                             LIMIT 1
+                             ) AS last_swap ON TRUE
+                                  LEFT JOIN LATERAL (
+                             SELECT event_id, sqrt_ratio, tick
+                             FROM pool_initializations
+                             WHERE pool_initializations.pool_key_hash = pool_keys.key_hash
+                             ORDER BY event_id DESC
+                             LIMIT 1
+                             ) AS pi ON TRUE
+                         WHERE key_hash = NEW.pool_key_hash),
+                 pl AS (SELECT key_hash,
+                               (SELECT event_id
+                                FROM position_updates
+                                WHERE key_hash = position_updates.pool_key_hash
+                                ORDER BY event_id DESC
+                                LIMIT 1)                                   AS last_update_event_id,
+                               (COALESCE(liquidity_last, 0) + COALESCE((SELECT SUM(liquidity_delta)
+                                                                        FROM position_updates AS pu
+                                                                        WHERE lss.last_swap_event_id < pu.event_id
+                                                                          AND pu.pool_key_hash = lss.key_hash
+                                                                          AND lss.tick BETWEEN pu.lower_bound AND (pu.upper_bound - 1)),
+                                                                       0)) AS liquidity
+                        FROM lss)
+            UPDATE pool_states_table
+            SET last_event_id                  = GREATEST(lss.last_swap_event_id, pl.last_update_event_id),
+                last_liquidity_update_event_id = pl.last_update_event_id,
+                sqrt_ratio                     = lss.sqrt_ratio,
+                tick                           = lss.tick,
+                liquidity                      = pl.liquidity
+            FROM lss
+                     JOIN pl ON lss.key_hash = pl.key_hash
+            WHERE pool_states_table.pool_key_hash = lss.key_hash;
+
+            -- If no row exists, insert it
+            IF NOT FOUND THEN
+                INSERT INTO pool_states_table (pool_key_hash, last_event_id, last_liquidity_update_event_id, sqrt_ratio, liquidity, tick)
+                SELECT lss.key_hash                                              AS pool_key_hash,
+                       GREATEST(lss.last_swap_event_id, pl.last_update_event_id) AS last_event_id,
+                       pl.last_update_event_id                                   AS last_liquidity_update_event_id,
+                       sqrt_ratio,
+                       liquidity,
+                       tick
+                FROM lss
+                         JOIN pl ON lss.key_hash = pl.key_hash
+                WHERE lss.key_hash = NEW.pool_key_hash;
+            END IF;
+
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- Triggers to update pool_states_table
+        CREATE OR REPLACE TRIGGER update_pool_states_after_swap
+            AFTER INSERT OR UPDATE
+            ON swaps
+            FOR EACH ROW
+        EXECUTE FUNCTION update_pool_states_after_swap();
+
+        CREATE OR REPLACE TRIGGER update_pool_states_after_position_update
+            AFTER INSERT OR UPDATE
+            ON position_updates
+            FOR EACH ROW
+        EXECUTE FUNCTION update_pool_states_after_position_update();
+
+        CREATE OR REPLACE TRIGGER update_pool_states_after_pool_init
+            AFTER INSERT OR UPDATE
+            ON pool_initializations
+            FOR EACH ROW
+        EXECUTE FUNCTION update_pool_states_after_pool_init();
 
         CREATE TABLE IF NOT EXISTS hourly_volume_by_token
         (
@@ -517,20 +751,133 @@ export class DAO {
                            ON tvl_delta_24h.key_hash = pool_keys.key_hash
             );
 
-        CREATE MATERIALIZED VIEW IF NOT EXISTS last_24h_pool_stats_materialized AS
+        CREATE TABLE IF NOT EXISTS last_24h_pool_stats_table
         (
-        SELECT key_hash,
-               volume0_24h,
-               volume1_24h,
-               fees0_24h,
-               fees1_24h,
-               tvl0_total,
-               tvl1_total,
-               tvl0_delta_24h,
-               tvl1_delta_24h
-        FROM last_24h_pool_stats_view
-            );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_last_24h_pool_stats_materialized_key_hash ON last_24h_pool_stats_materialized USING btree (key_hash);
+            key_hash       NUMERIC PRIMARY KEY,
+            volume0_24h    NUMERIC,
+            volume1_24h    NUMERIC,
+            fees0_24h      NUMERIC,
+            fees1_24h      NUMERIC,
+            tvl0_total     NUMERIC,
+            tvl1_total     NUMERIC,
+            tvl0_delta_24h NUMERIC,
+            tvl1_delta_24h NUMERIC
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_last_24h_pool_stats_table_key_hash ON last_24h_pool_stats_table USING btree (key_hash);
+
+        -- Initial population of the table
+        DELETE FROM last_24h_pool_stats_table;
+        INSERT INTO last_24h_pool_stats_table (key_hash, volume0_24h, volume1_24h, fees0_24h, fees1_24h, tvl0_total, tvl1_total, tvl0_delta_24h, tvl1_delta_24h)
+        SELECT key_hash, volume0_24h, volume1_24h, fees0_24h, fees1_24h, tvl0_total, tvl1_total, tvl0_delta_24h, tvl1_delta_24h
+        FROM last_24h_pool_stats_view;
+
+        -- Function to update last_24h_pool_stats_table after hourly_volume_by_token changes
+        CREATE OR REPLACE FUNCTION update_last_24h_pool_stats_after_volume_change()
+            RETURNS TRIGGER AS
+        $$
+        BEGIN
+            -- Update the last_24h_pool_stats_table based on the last_24h_pool_stats_view
+            WITH volume AS (SELECT vbt.key_hash,
+                                   SUM(CASE WHEN vbt.token = token0 THEN vbt.volume ELSE 0 END) AS volume0,
+                                   SUM(CASE WHEN vbt.token = token1 THEN vbt.volume ELSE 0 END) AS volume1,
+                                   SUM(CASE WHEN vbt.token = token0 THEN vbt.fees ELSE 0 END)   AS fees0,
+                                   SUM(CASE WHEN vbt.token = token1 THEN vbt.fees ELSE 0 END)   AS fees1
+                            FROM hourly_volume_by_token vbt
+                                     JOIN pool_keys ON vbt.key_hash = pool_keys.key_hash
+                            WHERE hour >= NOW() - INTERVAL '24 hours'
+                            GROUP BY vbt.key_hash)
+            UPDATE last_24h_pool_stats_table
+            SET volume0_24h = COALESCE(volume.volume0, 0),
+                volume1_24h = COALESCE(volume.volume1, 0),
+                fees0_24h   = COALESCE(volume.fees0, 0),
+                fees1_24h   = COALESCE(volume.fees1, 0)
+            FROM volume
+            WHERE last_24h_pool_stats_table.key_hash = volume.key_hash;
+
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- Function to update last_24h_pool_stats_table after hourly_tvl_delta_by_token changes
+        CREATE OR REPLACE FUNCTION update_last_24h_pool_stats_after_tvl_change()
+            RETURNS TRIGGER AS
+        $$
+        BEGIN
+            -- Update the last_24h_pool_stats_table based on the last_24h_pool_stats_view
+            WITH tvl_total AS (SELECT tbt.key_hash,
+                                      SUM(CASE WHEN token = token0 THEN delta ELSE 0 END) AS tvl0,
+                                      SUM(CASE WHEN token = token1 THEN delta ELSE 0 END) AS tvl1
+                               FROM hourly_tvl_delta_by_token tbt
+                                        JOIN pool_keys pk ON tbt.key_hash = pk.key_hash
+                               GROUP BY tbt.key_hash),
+                 tvl_delta_24h AS (SELECT tbt.key_hash,
+                                          SUM(CASE WHEN token = token0 THEN delta ELSE 0 END) AS tvl0,
+                                          SUM(CASE WHEN token = token1 THEN delta ELSE 0 END) AS tvl1
+                                   FROM hourly_tvl_delta_by_token tbt
+                                            JOIN pool_keys pk ON tbt.key_hash = pk.key_hash
+                                   WHERE hour >= NOW() - INTERVAL '24 hours'
+                                   GROUP BY tbt.key_hash)
+            UPDATE last_24h_pool_stats_table
+            SET tvl0_total     = COALESCE(tvl_total.tvl0, 0),
+                tvl1_total     = COALESCE(tvl_total.tvl1, 0),
+                tvl0_delta_24h = COALESCE(tvl_delta_24h.tvl0, 0),
+                tvl1_delta_24h = COALESCE(tvl_delta_24h.tvl1, 0)
+            FROM tvl_total
+                     LEFT JOIN tvl_delta_24h ON tvl_total.key_hash = tvl_delta_24h.key_hash
+            WHERE last_24h_pool_stats_table.key_hash = tvl_total.key_hash;
+
+            -- Insert new rows for keys that don't exist yet
+            INSERT INTO last_24h_pool_stats_table (key_hash, volume0_24h, volume1_24h, fees0_24h, fees1_24h, tvl0_total, tvl1_total, tvl0_delta_24h, tvl1_delta_24h)
+            SELECT pool_keys.key_hash,
+                   COALESCE(volume.volume0, 0)     AS volume0_24h,
+                   COALESCE(volume.volume1, 0)     AS volume1_24h,
+                   COALESCE(volume.fees0, 0)       AS fees0_24h,
+                   COALESCE(volume.fees1, 0)       AS fees1_24h,
+                   COALESCE(tvl_total.tvl0, 0)     AS tvl0_total,
+                   COALESCE(tvl_total.tvl1, 0)     AS tvl1_total,
+                   COALESCE(tvl_delta_24h.tvl0, 0) AS tvl0_delta_24h,
+                   COALESCE(tvl_delta_24h.tvl1, 0) AS tvl1_delta_24h
+            FROM pool_keys
+                     LEFT JOIN (SELECT vbt.key_hash,
+                                       SUM(CASE WHEN vbt.token = token0 THEN vbt.volume ELSE 0 END) AS volume0,
+                                       SUM(CASE WHEN vbt.token = token1 THEN vbt.volume ELSE 0 END) AS volume1,
+                                       SUM(CASE WHEN vbt.token = token0 THEN vbt.fees ELSE 0 END)   AS fees0,
+                                       SUM(CASE WHEN vbt.token = token1 THEN vbt.fees ELSE 0 END)   AS fees1
+                                FROM hourly_volume_by_token vbt
+                                         JOIN pool_keys ON vbt.key_hash = pool_keys.key_hash
+                                WHERE hour >= NOW() - INTERVAL '24 hours'
+                                GROUP BY vbt.key_hash) AS volume ON volume.key_hash = pool_keys.key_hash
+                     LEFT JOIN (SELECT tbt.key_hash,
+                                       SUM(CASE WHEN token = token0 THEN delta ELSE 0 END) AS tvl0,
+                                       SUM(CASE WHEN token = token1 THEN delta ELSE 0 END) AS tvl1
+                                FROM hourly_tvl_delta_by_token tbt
+                                         JOIN pool_keys pk ON tbt.key_hash = pk.key_hash
+                                GROUP BY tbt.key_hash) AS tvl_total ON pool_keys.key_hash = tvl_total.key_hash
+                     LEFT JOIN (SELECT tbt.key_hash,
+                                       SUM(CASE WHEN token = token0 THEN delta ELSE 0 END) AS tvl0,
+                                       SUM(CASE WHEN token = token1 THEN delta ELSE 0 END) AS tvl1
+                                FROM hourly_tvl_delta_by_token tbt
+                                         JOIN pool_keys pk ON tbt.key_hash = pk.key_hash
+                                WHERE hour >= NOW() - INTERVAL '24 hours'
+                                GROUP BY tbt.key_hash) AS tvl_delta_24h ON tvl_delta_24h.key_hash = pool_keys.key_hash
+            WHERE NOT EXISTS (SELECT 1 FROM last_24h_pool_stats_table WHERE key_hash = pool_keys.key_hash);
+
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- Triggers to update last_24h_pool_stats_table
+        CREATE OR REPLACE TRIGGER update_last_24h_pool_stats_after_volume_change
+            AFTER INSERT OR UPDATE OR DELETE
+            ON hourly_volume_by_token
+            FOR EACH STATEMENT
+        EXECUTE FUNCTION update_last_24h_pool_stats_after_volume_change();
+
+        CREATE OR REPLACE TRIGGER update_last_24h_pool_stats_after_tvl_change
+            AFTER INSERT OR UPDATE OR DELETE
+            ON hourly_tvl_delta_by_token
+            FOR EACH STATEMENT
+        EXECUTE FUNCTION update_last_24h_pool_stats_after_tvl_change();
 
         CREATE OR REPLACE VIEW oracle_pool_states_view AS
         (
@@ -540,12 +887,62 @@ export class DAO {
                  JOIN pool_keys pk ON ek.emitter = pk.extension
         GROUP BY pk.key_hash);
 
-        CREATE MATERIALIZED VIEW IF NOT EXISTS oracle_pool_states_materialized AS
+        CREATE TABLE IF NOT EXISTS oracle_pool_states_table
         (
-        SELECT pool_key_hash,
-               last_snapshot_block_timestamp
-        FROM oracle_pool_states_view);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_oracle_pool_states_materialized_pool_key_hash ON oracle_pool_states_materialized USING btree (pool_key_hash);
+            pool_key_hash                 NUMERIC PRIMARY KEY,
+            last_snapshot_block_timestamp int8
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_oracle_pool_states_table_pool_key_hash ON oracle_pool_states_table USING btree (pool_key_hash);
+
+        -- Initial population of the table
+        DELETE FROM oracle_pool_states_table;
+        INSERT INTO oracle_pool_states_table (pool_key_hash, last_snapshot_block_timestamp)
+        SELECT pool_key_hash, last_snapshot_block_timestamp
+        FROM oracle_pool_states_view;
+
+        -- Function to update oracle_pool_states_table after an oracle snapshot
+        CREATE OR REPLACE FUNCTION update_oracle_pool_states_after_snapshot()
+            RETURNS TRIGGER AS
+        $$
+        BEGIN
+            -- Get the extension from the event_keys
+            WITH extension_data AS (
+                SELECT ek.emitter, os.snapshot_block_timestamp
+                FROM event_keys ek
+                JOIN oracle_snapshots os ON ek.id = os.event_id
+                WHERE ek.id = NEW.event_id
+            ),
+            -- Get the pool_key_hash from the extension
+            pool_data AS (
+                SELECT pk.key_hash AS pool_key_hash, ed.snapshot_block_timestamp
+                FROM extension_data ed
+                JOIN pool_keys pk ON ed.emitter = pk.extension
+            )
+            -- Update the oracle_pool_states_table
+            UPDATE oracle_pool_states_table
+            SET last_snapshot_block_timestamp = pd.snapshot_block_timestamp
+            FROM pool_data pd
+            WHERE oracle_pool_states_table.pool_key_hash = pd.pool_key_hash
+            AND (oracle_pool_states_table.last_snapshot_block_timestamp IS NULL 
+                 OR oracle_pool_states_table.last_snapshot_block_timestamp < pd.snapshot_block_timestamp);
+
+            -- If no row exists, insert it
+            IF NOT FOUND THEN
+                INSERT INTO oracle_pool_states_table (pool_key_hash, last_snapshot_block_timestamp)
+                SELECT pd.pool_key_hash, pd.snapshot_block_timestamp
+                FROM pool_data pd;
+            END IF;
+
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- Trigger to update oracle_pool_states_table
+        CREATE OR REPLACE TRIGGER update_oracle_pool_states_after_snapshot
+            AFTER INSERT
+            ON oracle_snapshots
+            FOR EACH ROW
+        EXECUTE FUNCTION update_oracle_pool_states_after_snapshot();
     `);
   }
 
@@ -783,16 +1180,14 @@ export class DAO {
       values: [since],
     });
 
-    await this.pg.query(`
-      REFRESH MATERIALIZED VIEW CONCURRENTLY last_24h_pool_stats_materialized;
-    `);
+    // No need to refresh last_24h_pool_stats_materialized as it's been replaced with a table
+    // that is automatically updated via triggers
   }
 
   public async refreshOperationalMaterializedView() {
-    await this.pg.query(`
-      REFRESH MATERIALIZED VIEW CONCURRENTLY pool_states_materialized;
-      REFRESH MATERIALIZED VIEW CONCURRENTLY oracle_pool_states_materialized;
-    `);
+    // No need to refresh materialized views anymore as they've been replaced with tables
+    // that are automatically updated via triggers
+    // This method is kept for backward compatibility
   }
 
   private async loadCursor(): Promise<
