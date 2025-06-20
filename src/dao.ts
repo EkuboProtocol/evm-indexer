@@ -802,43 +802,58 @@ export class DAO {
                                    OVER (PARTITION BY ppptliv.pool_key_hash ORDER BY ppptliv.tick)                          AS tick_end
                             FROM per_pool_per_tick_liquidity_incremental_view ppptliv
                                      JOIN pool_states ps ON ppptliv.pool_key_hash = ps.key_hash),
-             depth_liquidity_ranges AS (SELECT pt.pool_key_hash,
+             -- Generate slices of 0.1% (1000 basis points = 0.1%)
+             depth_slices AS (SELECT ps.key_hash AS pool_key_hash,
+                                     slice_num,
+                                     -- Convert basis points to percentage for display (1000 bp = 0.1%)
+                                     ROUND((ps.fee / 0x10000000000000000::NUMERIC * 100) + (slice_num * 0.1), 1) AS slice_start_percent,
+                                     ROUND((ps.fee / 0x10000000000000000::NUMERIC * 100) + ((slice_num + 1) * 0.1), 1) AS slice_end_percent,
+                                     -- Convert percentage to ticks for calculation
+                                     ps.last_tick + ps.fee_in_ticks + CEIL(slice_num * 1000 * LOG(1.000001))::int4 AS slice_start_tick_above,
+                                     ps.last_tick + ps.fee_in_ticks + CEIL((slice_num + 1) * 1000 * LOG(1.000001))::int4 AS slice_end_tick_above,
+                                     ps.last_tick - ps.fee_in_ticks - CEIL((slice_num + 1) * 1000 * LOG(1.000001))::int4 AS slice_start_tick_below,
+                                     ps.last_tick - ps.fee_in_ticks - CEIL(slice_num * 1000 * LOG(1.000001))::int4 AS slice_end_tick_below
+                              FROM pool_states ps
+                                       CROSS JOIN LATERAL generate_series(0, 
+                                                      FLOOR(((ps.realized_volatility - (ps.fee / 0x10000000000000000::NUMERIC)) * 1000)::int4) - 1
+                                                  ) AS slice_num
+                              WHERE ps.fee_in_ticks < ps.volatility_in_ticks),
+             depth_liquidity_ranges AS (SELECT ds.pool_key_hash,
+                                               ds.slice_start_percent,
+                                               ds.slice_end_percent,
                                                pt.liquidity,
-                                               INT4RANGE(ps.last_tick - ps.volatility_in_ticks,
-                                                         ps.last_tick - ps.fee_in_ticks) *
+                                               INT4RANGE(ds.slice_start_tick_below, ds.slice_end_tick_below) *
                                                INT4RANGE(pt.tick_start, pt.tick_end) AS overlap_range_below,
-                                               INT4RANGE(ps.last_tick + ps.fee_in_ticks,
-                                                         ps.last_tick + ps.volatility_in_ticks) *
+                                               INT4RANGE(ds.slice_start_tick_above, ds.slice_end_tick_above) *
                                                INT4RANGE(pt.tick_start, pt.tick_end) AS overlap_range_above
-                                        FROM pool_ticks pt
-                                                 JOIN pool_states ps ON pt.pool_key_hash = ps.key_hash
-                                        WHERE liquidity != 0
-                                          AND ps.fee_in_ticks < ps.volatility_in_ticks),
-             token_amounts_by_pool AS (SELECT pool_key_hash,
+                                        FROM depth_slices ds
+                                                 JOIN pool_ticks pt ON pt.pool_key_hash = ds.pool_key_hash
+                                        WHERE pt.liquidity != 0),
+             token_amounts_by_slice AS (SELECT pool_key_hash,
+                                               slice_start_percent,
+                                               slice_end_percent,
 -- compute amount1 corresponding to liquidity in overlap_range_below
-                                              FLOOR(SUM(liquidity *
-                                                        (POWER(1.0000005::NUMERIC, UPPER(overlap_range_below)) -
-                                                         POWER(1.0000005::NUMERIC, LOWER(overlap_range_below))))) AS amount1,
+                                               FLOOR(SUM(liquidity *
+                                                         (POWER(1.0000005::NUMERIC, UPPER(overlap_range_below)) -
+                                                          POWER(1.0000005::NUMERIC, LOWER(overlap_range_below))))) AS amount1,
 -- compute amount0 corresponding to liquidity in overlap_range_above
-                                              FLOOR(SUM(
-                                                      liquidity *
-                                                      ((1::NUMERIC /
-                                                        POWER(1.0000005::NUMERIC, LOWER(overlap_range_above))) -
-                                                       (1::NUMERIC /
-                                                        POWER(1.0000005::NUMERIC, UPPER(overlap_range_above)))))) AS amount0
-                                       FROM depth_liquidity_ranges
-                                       WHERE NOT ISEMPTY(overlap_range_below)
-                                          OR NOT ISEMPTY(overlap_range_above)
-                                       GROUP BY pool_key_hash),
-             total_depth AS (SELECT pool_key_hash,
-                                    COALESCE(SUM(amount0), 0) AS depth0,
-                                    COALESCE(SUM(amount1), 0) AS depth1
-                             FROM token_amounts_by_pool tabp
-                                      JOIN pool_states ps ON tabp.pool_key_hash = ps.key_hash
-                             GROUP BY pool_key_hash, ps.realized_volatility)
-        SELECT td.pool_key_hash, ps.realized_volatility::FLOAT AS depth_percent, td.depth0, td.depth1
-        FROM total_depth td
-                 JOIN pool_states ps ON ps.key_hash = td.pool_key_hash;
+                                               FLOOR(SUM(
+                                                       liquidity *
+                                                       ((1::NUMERIC /
+                                                         POWER(1.0000005::NUMERIC, LOWER(overlap_range_above))) -
+                                                        (1::NUMERIC /
+                                                         POWER(1.0000005::NUMERIC, UPPER(overlap_range_above)))))) AS amount0
+                                        FROM depth_liquidity_ranges
+                                        WHERE NOT ISEMPTY(overlap_range_below)
+                                           OR NOT ISEMPTY(overlap_range_above)
+                                        GROUP BY pool_key_hash, slice_start_percent, slice_end_percent)
+        SELECT pool_key_hash,
+               slice_start_percent,
+               slice_end_percent,
+               COALESCE(amount0, 0) AS depth0,
+               COALESCE(amount1, 0) AS depth1
+        FROM token_amounts_by_slice
+        ORDER BY pool_key_hash, slice_start_percent;
 
         CREATE MATERIALIZED VIEW IF NOT EXISTS token_pair_realized_volatility AS
         SELECT * FROM token_pair_realized_volatility_view;
@@ -847,7 +862,7 @@ export class DAO {
         SELECT * FROM pool_market_depth_view;
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_market_depth
-            ON pool_market_depth (pool_key_hash);
+            ON pool_market_depth (pool_key_hash, slice_start_percent);
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_token_pair_realized_volatility_pair
             ON token_pair_realized_volatility (token0, token1);
