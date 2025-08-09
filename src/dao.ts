@@ -981,6 +981,148 @@ export class DAO {
       values: [since],
     });
 
+    // Add TWAMM volume calculation
+    await this.pg.query({
+      text: `
+                INSERT INTO hourly_volume_by_token
+                    (WITH twamm_time_periods AS (
+                        -- Get all time points where sale rates change for each pool
+                        SELECT pool_key_hash, 
+                               time AS change_time,
+                               SUM(net_sale_rate_delta0) OVER (
+                                   PARTITION BY pool_key_hash 
+                                   ORDER BY time 
+                                   ROWS UNBOUNDED PRECEDING
+                               ) AS cumulative_sale_rate0,
+                               SUM(net_sale_rate_delta1) OVER (
+                                   PARTITION BY pool_key_hash 
+                                   ORDER BY time 
+                                   ROWS UNBOUNDED PRECEDING
+                               ) AS cumulative_sale_rate1
+                        FROM twamm_sale_rate_deltas_materialized
+                        WHERE time >= $1::timestamptz - INTERVAL '1 hour'
+                        
+                        UNION ALL
+                        
+                        -- Include virtual order execution times as they reset the baseline
+                        SELECT tvoe.key_hash AS pool_key_hash,
+                               b.time AS change_time,
+                               tvoe.token0_sale_rate AS cumulative_sale_rate0,
+                               tvoe.token1_sale_rate AS cumulative_sale_rate1
+                        FROM twamm_virtual_order_executions tvoe
+                        JOIN event_keys ek ON tvoe.event_id = ek.id
+                        JOIN blocks b ON ek.block_number = b.number
+                        WHERE b.time >= $1::timestamptz - INTERVAL '1 hour'
+                    ),
+                    ordered_periods AS (
+                        SELECT pool_key_hash,
+                               change_time,
+                               cumulative_sale_rate0,
+                               cumulative_sale_rate1,
+                               LEAD(change_time) OVER (
+                                   PARTITION BY pool_key_hash 
+                                   ORDER BY change_time
+                               ) AS next_change_time
+                        FROM twamm_time_periods
+                        ORDER BY pool_key_hash, change_time
+                    ),
+                    twamm_swap_volume AS (
+                        -- Calculate volume from TWAMM swaps (to subtract from calculated volume)
+                        SELECT swaps.pool_key_hash AS key_hash,
+                               DATE_TRUNC('hour', blocks.time) AS hour,
+                               (CASE WHEN swaps.delta0 >= 0 THEN pool_keys.token0 ELSE pool_keys.token1 END) AS token,
+                               SUM(CASE WHEN swaps.delta0 >= 0 THEN swaps.delta0 ELSE swaps.delta1 END) AS volume
+                        FROM swaps
+                        JOIN pool_keys ON swaps.pool_key_hash = pool_keys.key_hash
+                        JOIN event_keys ON swaps.event_id = event_keys.id
+                        JOIN blocks ON event_keys.block_number = blocks.number
+                        WHERE DATE_TRUNC('hour', blocks.time) >= DATE_TRUNC('hour', $1::timestamptz)
+                          AND swaps.locker = $2::NUMERIC
+                        GROUP BY hour, swaps.pool_key_hash, token
+                    ),
+                    hourly_twamm_volume AS (
+                        SELECT op.pool_key_hash AS key_hash,
+                               DATE_TRUNC('hour', h.hour_start) AS hour,
+                               pk.token0 AS token,
+                               SUM(
+                                   CASE 
+                                       WHEN op.cumulative_sale_rate0 > 0 THEN
+                                           op.cumulative_sale_rate0 * 
+                                           EXTRACT(EPOCH FROM LEAST(
+                                               h.hour_start + INTERVAL '1 hour',
+                                               COALESCE(op.next_change_time, NOW())
+                                           ) - GREATEST(h.hour_start, op.change_time)) / 3600
+                                       ELSE 0
+                                   END
+                               ) AS volume
+                        FROM ordered_periods op
+                        JOIN pool_keys pk ON op.pool_key_hash = pk.key_hash
+                        CROSS JOIN (
+                            SELECT generate_series AS hour_start
+                            FROM generate_series(
+                                DATE_TRUNC('hour', $1::timestamptz),
+                                DATE_TRUNC('hour', NOW()),
+                                INTERVAL '1 hour'
+                            )
+                        ) h
+                        WHERE op.change_time <= h.hour_start + INTERVAL '1 hour'
+                          AND (op.next_change_time IS NULL OR op.next_change_time > h.hour_start)
+                          AND op.cumulative_sale_rate0 > 0
+                        GROUP BY op.pool_key_hash, h.hour_start, pk.token0
+                        
+                        UNION ALL
+                        
+                        SELECT op.pool_key_hash AS key_hash,
+                               DATE_TRUNC('hour', h.hour_start) AS hour,
+                               pk.token1 AS token,
+                               SUM(
+                                   CASE 
+                                       WHEN op.cumulative_sale_rate1 > 0 THEN
+                                           op.cumulative_sale_rate1 * 
+                                           EXTRACT(EPOCH FROM LEAST(
+                                               h.hour_start + INTERVAL '1 hour',
+                                               COALESCE(op.next_change_time, NOW())
+                                           ) - GREATEST(h.hour_start, op.change_time)) / 3600
+                                       ELSE 0
+                                   END
+                               ) AS volume
+                        FROM ordered_periods op
+                        JOIN pool_keys pk ON op.pool_key_hash = pk.key_hash
+                        CROSS JOIN (
+                            SELECT generate_series AS hour_start
+                            FROM generate_series(
+                                DATE_TRUNC('hour', $1::timestamptz),
+                                DATE_TRUNC('hour', NOW()),
+                                INTERVAL '1 hour'
+                            )
+                        ) h
+                        WHERE op.change_time <= h.hour_start + INTERVAL '1 hour'
+                          AND (op.next_change_time IS NULL OR op.next_change_time > h.hour_start)
+                          AND op.cumulative_sale_rate1 > 0
+                        GROUP BY op.pool_key_hash, h.hour_start, pk.token1
+                    ),
+                    net_twamm_volume AS (
+                        SELECT htv.key_hash, 
+                               htv.hour, 
+                               htv.token, 
+                               GREATEST(0, htv.volume - COALESCE(tsv.volume, 0)) AS volume
+                        FROM hourly_twamm_volume htv
+                        LEFT JOIN twamm_swap_volume tsv 
+                          ON htv.key_hash = tsv.key_hash 
+                          AND htv.hour = tsv.hour 
+                          AND htv.token = tsv.token
+                        WHERE htv.volume > 0
+                    )
+                    SELECT key_hash, hour, token, SUM(volume) AS volume, 0 AS fees, 0 AS swap_count
+                    FROM net_twamm_volume
+                    WHERE volume > 0
+                    GROUP BY key_hash, hour, token)
+                ON CONFLICT (key_hash, hour, token)
+                    DO UPDATE SET volume = hourly_volume_by_token.volume + excluded.volume;
+            `,
+      values: [since, BigInt(process.env.TWAMM_ADDRESS!)],
+    });
+
     await this.pg.query({
       text: `
                 INSERT INTO hourly_revenue_by_token
