@@ -917,6 +917,18 @@ export class DAO {
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_market_depth
             ON pool_market_depth (pool_key_hash, depth_percent);
+
+        -- Unified table for all pool balance changes
+        CREATE TABLE IF NOT EXISTS pool_balance_changes
+        (
+            event_id      int8    NOT NULL REFERENCES event_keys (id) ON DELETE CASCADE PRIMARY KEY,
+            pool_key_hash NUMERIC NOT NULL REFERENCES pool_keys (key_hash),
+            delta0        NUMERIC NOT NULL,
+            delta1        NUMERIC NOT NULL,
+            event_type    TEXT    NOT NULL CHECK (event_type IN ('swap', 'position_update', 'position_fees_collected', 'fees_accumulated', 'twamm_proceeds_withdrawn'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_pool_balance_changes_pool_key_hash_event_id ON pool_balance_changes USING btree (pool_key_hash, event_id);
+        CREATE INDEX IF NOT EXISTS idx_pool_balance_changes_event_type ON pool_balance_changes USING btree (event_type);
     `);
   }
 
@@ -1081,60 +1093,36 @@ export class DAO {
                                              WHERE b.time >= DATE_TRUNC('hour', $1::timestamptz)
                                              ORDER BY id
                                              LIMIT 1),
-                          grouped_pool_key_hash_deltas AS (SELECT pool_key_hash,
-                                                                  DATE_TRUNC('hour', blocks.time) AS hour,
-                                                                  SUM(delta0)                     AS delta0,
-                                                                  SUM(delta1)                     AS delta1
-                                                           FROM swaps
-                                                                    JOIN event_keys ON swaps.event_id = event_keys.id
-                                                                    JOIN blocks ON event_keys.block_number = blocks.number
-                                                           WHERE event_id >= (SELECT id FROM first_event_id)
-                                                           GROUP BY pool_key_hash, hour
-
-                                                           UNION ALL
-
-                                                           SELECT pool_key_hash,
-                                                                  DATE_TRUNC('hour', blocks.time) AS hour,
-                                                                  SUM(CASE
-                                                                          WHEN liquidity_delta < 0 THEN CEIL(
-                                                                                  (delta0 * 0x10000000000000000::NUMERIC) /
-                                                                                  (0x10000000000000000::NUMERIC - pk.fee))
-                                                                          ELSE delta0 END)        AS delta0,
-                                                                  SUM(CASE
-                                                                          WHEN liquidity_delta < 0 THEN CEIL(
-                                                                                  (delta1 * 0x10000000000000000::NUMERIC) /
-                                                                                  (0x10000000000000000::NUMERIC - pk.fee))
-                                                                          ELSE delta1 END)        AS delta1
-                                                           FROM position_updates pu
-                                                                    JOIN event_keys ON pu.event_id = event_keys.id
-                                                                    JOIN blocks ON event_keys.block_number = blocks.number
-                                                                    JOIN pool_keys pk ON pu.pool_key_hash = pk.key_hash
-                                                           WHERE event_id >= (SELECT id FROM first_event_id)
-                                                           GROUP BY pool_key_hash, DATE_TRUNC('hour', blocks.time)
-
-                                                           UNION ALL
-
-                                                           SELECT pool_key_hash,
-                                                                  DATE_TRUNC('hour', blocks.time) AS hour,
-                                                                  SUM(-delta0)                    AS delta0,
-                                                                  SUM(-delta1)                    AS delta1
-                                                           FROM position_fees_collected
-                                                                    JOIN event_keys ON position_fees_collected.event_id = event_keys.id
-                                                                    JOIN blocks ON event_keys.block_number = blocks.number
-                                                           WHERE event_id >= (SELECT id FROM first_event_id)
-                                                           GROUP BY pool_key_hash, DATE_TRUNC('hour', blocks.time)
-
-                                                           UNION ALL
-
-                                                           SELECT pool_key_hash,
-                                                                  DATE_TRUNC('hour', blocks.time) AS hour,
-                                                                  SUM(amount0)                    AS delta0,
-                                                                  SUM(amount1)                    AS delta1
-                                                           FROM fees_accumulated
-                                                                    JOIN event_keys ON fees_accumulated.event_id = event_keys.id
-                                                                    JOIN blocks ON event_keys.block_number = blocks.number
-                                                           WHERE event_id >= (SELECT id FROM first_event_id)
-                                                           GROUP BY pool_key_hash, hour),
+                          -- Use the unified pool_balance_changes table with fee adjustments for position updates
+                          adjusted_pool_balance_changes AS (
+                              SELECT 
+                                  pbc.pool_key_hash,
+                                  DATE_TRUNC('hour', blocks.time) AS hour,
+                                  CASE 
+                                      WHEN pbc.event_type = 'position_update' AND pu.liquidity_delta < 0 THEN 
+                                          CEIL((pbc.delta0 * 0x10000000000000000::NUMERIC) / (0x10000000000000000::NUMERIC - pk.fee))
+                                      ELSE pbc.delta0 
+                                  END AS delta0,
+                                  CASE 
+                                      WHEN pbc.event_type = 'position_update' AND pu.liquidity_delta < 0 THEN 
+                                          CEIL((pbc.delta1 * 0x10000000000000000::NUMERIC) / (0x10000000000000000::NUMERIC - pk.fee))
+                                      ELSE pbc.delta1 
+                                  END AS delta1
+                              FROM pool_balance_changes pbc
+                              JOIN event_keys ek ON pbc.event_id = ek.id
+                              JOIN blocks ON ek.block_number = blocks.number
+                              JOIN pool_keys pk ON pbc.pool_key_hash = pk.key_hash
+                              LEFT JOIN position_updates pu ON pbc.event_id = pu.event_id AND pbc.event_type = 'position_update'
+                              WHERE pbc.event_id >= (SELECT id FROM first_event_id)
+                          ),
+                          grouped_pool_key_hash_deltas AS (
+                              SELECT pool_key_hash,
+                                     hour,
+                                     SUM(delta0) AS delta0,
+                                     SUM(delta1) AS delta1
+                              FROM adjusted_pool_balance_changes
+                              GROUP BY pool_key_hash, hour
+                          ),
                           token_deltas AS (SELECT pool_key_hash,
                                                   grouped_pool_key_hash_deltas.hour,
                                                   pool_keys.token0 AS token,
@@ -1356,21 +1344,30 @@ export class DAO {
                 WITH inserted_event AS (
                     INSERT INTO event_keys (block_number, transaction_index, event_index, transaction_hash, emitter)
                         VALUES ($1, $2, $3, $4, $5)
-                        RETURNING id)
-                INSERT
-                INTO position_updates
-                (event_id,
-                 locker,
-                 pool_key_hash,
-                 salt,
-                 lower_bound,
-                 upper_bound,
-                 liquidity_delta,
-                 delta0,
-                 delta1)
-                VALUES ((SELECT id FROM inserted_event), $6,
-                        (SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $7),
-                        $8, $9, $10, $11, $12, $13);
+                        RETURNING id),
+                pool_key AS (
+                    SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $7
+                ),
+                position_insert AS (
+                    INSERT
+                    INTO position_updates
+                    (event_id,
+                     locker,
+                     pool_key_hash,
+                     salt,
+                     lower_bound,
+                     upper_bound,
+                     liquidity_delta,
+                     delta0,
+                     delta1)
+                    VALUES ((SELECT id FROM inserted_event), $6,
+                            (SELECT key_hash FROM pool_key),
+                            $8, $9, $10, $11, $12, $13)
+                    RETURNING event_id
+                )
+                INSERT INTO pool_balance_changes (event_id, pool_key_hash, delta0, delta1, event_type)
+                SELECT pi.event_id, pk.key_hash, $12, $13, 'position_update'
+                FROM position_insert pi, pool_key pk;
             `,
       values: [
         key.blockNumber,
@@ -1403,20 +1400,29 @@ export class DAO {
                 WITH inserted_event AS (
                     INSERT INTO event_keys (block_number, transaction_index, event_index, transaction_hash, emitter)
                         VALUES ($1, $2, $3, $4, $5)
-                        RETURNING id)
-                INSERT
-                INTO position_fees_collected
-                (event_id,
-                 pool_key_hash,
-                 owner,
-                 salt,
-                 lower_bound,
-                 upper_bound,
-                 delta0,
-                 delta1)
-                VALUES ((SELECT id FROM inserted_event),
-                        (SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $6),
-                        $7, $8, $9, $10, $11, $12);
+                        RETURNING id),
+                pool_key AS (
+                    SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $6
+                ),
+                fees_insert AS (
+                    INSERT
+                    INTO position_fees_collected
+                    (event_id,
+                     pool_key_hash,
+                     owner,
+                     salt,
+                     lower_bound,
+                     upper_bound,
+                     delta0,
+                     delta1)
+                    VALUES ((SELECT id FROM inserted_event),
+                            (SELECT key_hash FROM pool_key),
+                            $7, $8, $9, $10, $11, $12)
+                    RETURNING event_id
+                )
+                INSERT INTO pool_balance_changes (event_id, pool_key_hash, delta0, delta1, event_type)
+                SELECT fi.event_id, pk.key_hash, -$11, -$12, 'position_fees_collected'
+                FROM fees_insert fi, pool_key pk;
             `,
       values: [
         key.blockNumber,
@@ -1557,16 +1563,25 @@ export class DAO {
                 WITH inserted_event AS (
                     INSERT INTO event_keys (block_number, transaction_index, event_index, transaction_hash, emitter)
                         VALUES ($1, $2, $3, $4, $5)
-                        RETURNING id)
-                INSERT
-                INTO fees_accumulated
-                (event_id,
-                 pool_key_hash,
-                 amount0,
-                 amount1)
-                VALUES ((SELECT id FROM inserted_event),
-                        (SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $6),
-                        $7, $8);
+                        RETURNING id),
+                pool_key AS (
+                    SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $6
+                ),
+                fees_insert AS (
+                    INSERT
+                    INTO fees_accumulated
+                    (event_id,
+                     pool_key_hash,
+                     amount0,
+                     amount1)
+                    VALUES ((SELECT id FROM inserted_event),
+                            (SELECT key_hash FROM pool_key),
+                            $7, $8)
+                    RETURNING event_id
+                )
+                INSERT INTO pool_balance_changes (event_id, pool_key_hash, delta0, delta1, event_type)
+                SELECT fi.event_id, pk.key_hash, $7, $8, 'fees_accumulated'
+                FROM fees_insert fi, pool_key pk;
             `,
       values: [
         key.blockNumber,
@@ -1589,20 +1604,29 @@ export class DAO {
                 WITH inserted_event AS (
                     INSERT INTO event_keys (block_number, transaction_index, event_index, transaction_hash, emitter)
                         VALUES ($1, $2, $3, $4, $5)
-                        RETURNING id)
-                INSERT
-                INTO swaps
-                (event_id,
-                 locker,
-                 pool_key_hash,
-                 delta0,
-                 delta1,
-                 sqrt_ratio_after,
-                 tick_after,
-                 liquidity_after)
-                VALUES ((SELECT id FROM inserted_event), $6,
-                        (SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $7),
-                        $8, $9, $10, $11, $12);
+                        RETURNING id),
+                pool_key AS (
+                    SELECT key_hash FROM pool_keys WHERE core_address = $5 AND pool_id = $7
+                ),
+                swap_insert AS (
+                    INSERT
+                    INTO swaps
+                    (event_id,
+                     locker,
+                     pool_key_hash,
+                     delta0,
+                     delta1,
+                     sqrt_ratio_after,
+                     tick_after,
+                     liquidity_after)
+                    VALUES ((SELECT id FROM inserted_event), $6,
+                            (SELECT key_hash FROM pool_key),
+                            $8, $9, $10, $11, $12)
+                    RETURNING event_id
+                )
+                INSERT INTO pool_balance_changes (event_id, pool_key_hash, delta0, delta1, event_type)
+                SELECT si.event_id, pk.key_hash, $8, $9, 'swap'
+                FROM swap_insert si, pool_key pk;
             `,
       values: [
         key.blockNumber,
@@ -1733,18 +1757,28 @@ export class DAO {
                 WITH inserted_event AS (
                     INSERT INTO event_keys (block_number, transaction_index, event_index, transaction_hash, emitter)
                         VALUES ($1, $2, $3, $4, $5)
-                        RETURNING id)
-                INSERT
-                INTO twamm_proceeds_withdrawals
-                (event_id, key_hash, owner, salt, amount0, amount1, start_time, end_time)
-                VALUES ((SELECT id FROM inserted_event),
-                        (SELECT key_hash
-                         FROM pool_keys
-                         WHERE core_address = (SELECT ek.emitter
-                                               FROM extension_registrations er
-                                                        JOIN event_keys ek ON er.event_id = ek.id
-                                               WHERE er.extension = $5)
-                           AND pool_id = $6), $7, $8, $9, $10, $11, $12);
+                        RETURNING id),
+                pool_key AS (
+                    SELECT key_hash
+                    FROM pool_keys
+                    WHERE core_address = (SELECT ek.emitter
+                                          FROM extension_registrations er
+                                                   JOIN event_keys ek ON er.event_id = ek.id
+                                          WHERE er.extension = $5)
+                      AND pool_id = $6
+                ),
+                twamm_insert AS (
+                    INSERT
+                    INTO twamm_proceeds_withdrawals
+                    (event_id, key_hash, owner, salt, amount0, amount1, start_time, end_time)
+                    VALUES ((SELECT id FROM inserted_event),
+                            (SELECT key_hash FROM pool_key),
+                            $7, $8, $9, $10, $11, $12)
+                    RETURNING event_id
+                )
+                INSERT INTO pool_balance_changes (event_id, pool_key_hash, delta0, delta1, event_type)
+                SELECT ti.event_id, pk.key_hash, -$9, -$10, 'twamm_proceeds_withdrawn'
+                FROM twamm_insert ti, pool_key pk;
             `,
       values: [
         key.blockNumber,
